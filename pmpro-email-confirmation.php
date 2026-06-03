@@ -3,7 +3,7 @@
  * Plugin Name: Paid Memberships Pro - Email Confirmation Add On
  * Plugin URI: https://www.paidmembershipspro.com/add-ons/email-confirmation-add-on/
  * Description: Require email confirmation before certain levels are enabled for members.
- * Version: 0.9
+ * Version: 1.0
  * Author: Paid Memberships Pro
  * Author URI: https://www.paidmembershipspro.com/
  * Text Domain: pmpro-email-confirmation
@@ -23,9 +23,57 @@
  */
 
 function pmproec_load_plugin_text_domain() {
-	load_plugin_textdomain( 'pmpro-email-confirmation', false, basename( dirname( __FILE__ ) ) . '/languages' ); 
+	load_plugin_textdomain( 'pmpro-email-confirmation', false, basename( dirname( __FILE__ ) ) . '/languages' );
 }
-add_action( 'init', 'pmproec_load_plugin_text_domain' ); 
+add_action( 'init', 'pmproec_load_plugin_text_domain' );
+
+/**
+ * Enqueue admin styles.
+ */
+function pmproec_enqueue_admin_styles() {
+	// Only load on relevant admin pages
+	$screen = get_current_screen();
+	if ( ! $screen ) {
+		return;
+	}
+
+	// Load on users.php, pmpro-memberslist, and pmpro-member (Edit Member) pages
+	if ( in_array( $screen->id, array( 'users', 'memberships_page_pmpro-memberslist', 'memberships_page_pmpro-member' ) ) ) {
+		wp_enqueue_style(
+			'pmpro-email-confirmation-admin',
+			plugins_url( 'css/admin.css', __FILE__ ),
+			array(),
+			'1.0'
+		);
+	}
+}
+add_action( 'admin_enqueue_scripts', 'pmproec_enqueue_admin_styles' );
+
+/**
+ * Include the Member Edit Panel class if PMPro 3.0+ is active.
+ */
+function pmproec_include_member_edit_panel() {
+	// Check if PMPro 3.0+ with the panel system is available
+	if ( class_exists( 'PMPro_Member_Edit_Panel' ) ) {
+		require_once( dirname( __FILE__ ) . '/includes/class-pmpro-member-edit-panel-email-confirmation.php' );
+	}
+}
+add_action( 'plugins_loaded', 'pmproec_include_member_edit_panel' );
+
+/**
+ * Register the Email Confirmation panel on the Edit Member screen.
+ *
+ * @param array $panels Array of panel objects.
+ * @return array Modified array of panels.
+ */
+function pmproec_register_member_edit_panel( $panels ) {
+	// Only register if the class was successfully loaded
+	if ( class_exists( 'PMProEC_Member_Edit_Panel_Email_Confirmation' ) ) {
+		$panels[] = new PMProEC_Member_Edit_Panel_Email_Confirmation();
+	}
+	return $panels;
+}
+add_filter( 'pmpro_member_edit_panels', 'pmproec_register_member_edit_panel' ); 
 
 /*
 	Add checkbox to edit level page to set if level requires email confirmation.
@@ -487,12 +535,30 @@ add_filter( 'the_content', 'pmproec_show_account_email_notification' );
  * Add link to the user action links to validate a user.
  * Use the pmproec_validate_user_cap filter to change the capability required to see this.
  */	
-function pmproec_user_row_actions( $actions, $user ) {	
+function pmproec_user_row_actions( $actions, $user ) {
 	$cap = apply_filters( 'pmproec_validate_user_cap', 'edit_users' );
 	if ( current_user_can( $cap ) ) {
 		//check if they still have a validation key
-		$validation_key = get_user_meta( $user->ID, "pmpro_email_confirmation_key", true );		
-		if ( ! empty( $validation_key ) && $validation_key != "validated" )	{		
+		$validation_key = get_user_meta( $user->ID, "pmpro_email_confirmation_key", true );
+
+		// Check if any of the user's levels actually require confirmation
+		$member_levels = pmpro_getMembershipLevelsForUser( $user->ID );
+		$requires_confirmation = false;
+		if ( ! empty( $member_levels ) ) {
+			foreach ( $member_levels as $level ) {
+				if ( pmproec_isEmailConfirmationLevel( $level->id ) ) {
+					$requires_confirmation = true;
+					break;
+				}
+			}
+		}
+
+		// Only show actions if at least one level requires confirmation
+		if ( ! $requires_confirmation ) {
+			return $actions;
+		}
+
+		if ( ! empty( $validation_key ) && $validation_key != "validated" )	{
 			$url = admin_url( "users.php?pmproecvalidate=" . $user->ID );
 
 			if ( ! empty( $_REQUEST['s'] ) ) {
@@ -511,10 +577,12 @@ function pmproec_user_row_actions( $actions, $user ) {
 			$resend_url = wp_nonce_url( $resend_url, 'resendconfirmation_'.$user->ID );
 			$actions[] = '<a href="' . $resend_url . '">' . esc_html__( "Resend Confirmation Email", "pmpro-email-confirmation" ) . '</a>';
 		}
-		else
-			$actions[] = 'Validated';
+		elseif ( $validation_key === 'validated' ) {
+			// Only show "Validated" if they actually had a level that required confirmation
+			$actions[] = esc_html__( 'Validated', 'pmpro-email-confirmation' );
+		}
 	}
-	
+
 	return $actions;
 }
 add_filter('user_row_actions', 'pmproec_user_row_actions', 10, 2);
@@ -537,7 +605,7 @@ function pmproec_validate_user()
 		if(empty($user))
 		{
 			//user not found error
-			$pmproec_msg = __( 'Could not reset sessions. User not found.', 'pmpro-email-confirmation' );
+			$pmproec_msg = __( 'Could not validate user. User not found.', 'pmpro-email-confirmation' );
 			$pmproec_msgt = 'error';
 		}			
 		else
@@ -761,6 +829,124 @@ function pmproec_add_email_template( $templates, $page_name, $type = 'emails', $
 	return $templates;
 }
 add_filter( 'pmpro_email_custom_template_path', 'pmproec_add_email_template', 10, 5 );
+
+/**
+ * Add Email Confirmation status column to Members List.
+ *
+ * @param array $columns Array of columns to show on the Members List.
+ * @return array Modified array of columns.
+ */
+function pmproec_add_members_list_column( $columns ) {
+	// Insert the column after the 'membership' column
+	$new_columns = array();
+	foreach ( $columns as $key => $value ) {
+		$new_columns[ $key ] = $value;
+		if ( $key === 'membership' ) {
+			$new_columns['email_confirmation'] = __( 'Email Confirmed', 'pmpro-email-confirmation' );
+		}
+	}
+	return $new_columns;
+}
+add_filter( 'pmpro_manage_memberslist_columns', 'pmproec_add_members_list_column' );
+
+/**
+ * Display Email Confirmation status in Members List column.
+ *
+ * @param string $column_name The name of the column being displayed.
+ * @param int    $user_id The ID of the user whose row is being displayed.
+ */
+function pmproec_members_list_column_value( $column_name, $user_id ) {
+	if ( $column_name === 'email_confirmation' ) {
+		$validation_key = get_user_meta( $user_id, 'pmpro_email_confirmation_key', true );
+
+		// Check if any of the user's levels require confirmation
+		$member_levels = pmpro_getMembershipLevelsForUser( $user_id );
+		$requires_confirmation = false;
+		if ( ! empty( $member_levels ) ) {
+			foreach ( $member_levels as $level ) {
+				if ( pmproec_isEmailConfirmationLevel( $level->id ) ) {
+					$requires_confirmation = true;
+					break;
+				}
+			}
+		}
+
+		// Don't show anything if confirmation is not required for any level
+		if ( ! $requires_confirmation ) {
+			echo '—';
+			return;
+		}
+
+		if ( empty( $validation_key ) ) {
+			echo '<span class="pmpro-email-confirmation-status not-required">—</span>';
+		} elseif ( $validation_key === 'validated' ) {
+			echo '<span class="pmpro-email-confirmation-status confirmed">' . esc_html__( 'Confirmed', 'pmpro-email-confirmation' ) . '</span>';
+		} else {
+			echo '<span class="pmpro-email-confirmation-status pending">' . esc_html__( 'Pending', 'pmpro-email-confirmation' ) . '</span>';
+		}
+	}
+}
+add_action( 'pmpro_manage_memberslist_custom_column', 'pmproec_members_list_column_value', 10, 2 );
+
+/**
+ * Add Email Confirmation status column to Users list.
+ *
+ * @param array $columns Array of columns to show on the Users list.
+ * @return array Modified array of columns.
+ */
+function pmproec_add_users_list_column( $columns ) {
+	// Insert the column after the 'email' column
+	$new_columns = array();
+	foreach ( $columns as $key => $value ) {
+		$new_columns[ $key ] = $value;
+		if ( $key === 'email' ) {
+			$new_columns['email_confirmation'] = __( 'Email Confirmed', 'pmpro-email-confirmation' );
+		}
+	}
+	return $new_columns;
+}
+add_filter( 'manage_users_columns', 'pmproec_add_users_list_column' );
+
+/**
+ * Display Email Confirmation status in Users list column.
+ *
+ * @param string $output The output for the column.
+ * @param string $column_name The name of the column being displayed.
+ * @param int    $user_id The ID of the user whose row is being displayed.
+ * @return string The output to display in the column.
+ */
+function pmproec_users_list_column_value( $output, $column_name, $user_id ) {
+	if ( $column_name === 'email_confirmation' ) {
+		$validation_key = get_user_meta( $user_id, 'pmpro_email_confirmation_key', true );
+
+		// Check if any of the user's levels require confirmation
+		$member_levels = pmpro_getMembershipLevelsForUser( $user_id );
+		$requires_confirmation = false;
+		if ( ! empty( $member_levels ) ) {
+			foreach ( $member_levels as $level ) {
+				if ( pmproec_isEmailConfirmationLevel( $level->id ) ) {
+					$requires_confirmation = true;
+					break;
+				}
+			}
+		}
+
+		// Don't show anything if confirmation is not required for any level
+		if ( ! $requires_confirmation ) {
+			return '—';
+		}
+
+		if ( empty( $validation_key ) ) {
+			return '<span class="pmpro-email-confirmation-status not-required">—</span>';
+		} elseif ( $validation_key === 'validated' ) {
+			return '<span class="pmpro-email-confirmation-status confirmed">' . esc_html__( 'Confirmed', 'pmpro-email-confirmation' ) . '</span>';
+		} else {
+			return '<span class="pmpro-email-confirmation-status pending">' . esc_html__( 'Pending', 'pmpro-email-confirmation' ) . '</span>';
+		}
+	}
+	return $output;
+}
+add_filter( 'manage_users_custom_column', 'pmproec_users_list_column_value', 10, 3 );
 
 /**
  * Function to add links to the plugin row meta
